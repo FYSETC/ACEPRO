@@ -768,7 +768,7 @@ class AceInstance:
 
         return monitor
 
-    def _retract(self, slot, length, speed, on_retract_started=None, on_wait_for_ready=None, early_stop_callback=None):
+    def _retract(self, slot, length, speed, on_retract_started=None, on_wait_for_ready=None, early_stop_callback=None, resume_length=0, resume_speed=None):
         """
         Retract filament from slot with automatic retry on FORBIDDEN errors.
 
@@ -816,7 +816,11 @@ class AceInstance:
                     f"  ACE status before: {ace_status_before}"
                 )
 
-            request = self.protocol.build_unwind_filament_request(slot, length, speed)
+            resume_length = max(0.0, float(resume_length or 0))
+            fast_speed = float(speed if resume_speed is None else resume_speed)
+            follow_fast = resume_length > 0 and fast_speed > 0
+            command_length = length + resume_length if follow_fast else length
+            request = self.protocol.build_unwind_filament_request(slot, command_length, speed)
 
             response_container = {"response": None, "done": False}
 
@@ -880,14 +884,30 @@ class AceInstance:
                             f"ACE[{self.instance_num}]: Retract started callback error: {cb_error}"
                         )
 
-                expected_time_s = length / speed
-                dwell_time_s = expected_time_s
+                self._retract_speed_switched = False
+                self._active_retract_speed = float(speed)
+                if follow_fast:
+                    dwell_time_s = (length / speed) + (resume_length / fast_speed)
+                else:
+                    dwell_time_s = length / speed
+                switch_at = time.time() + (length / speed if follow_fast else dwell_time_s)
 
                 # Waiting 1/4 of the expected time before waiting for ready to avoid any
                 # timing issues with the ACE reporting ready inbetween gear shifting
                 # Call callback during dwell in case sensor changes early
-                dwell_end = time.time() + (dwell_time_s)
+                dwell_end = time.time() + dwell_time_s
                 while time.time() < dwell_end:
+                    if follow_fast and not self._retract_speed_switched and time.time() >= switch_at:
+                        self._retract_speed_switched = True
+                        self._active_retract_speed = fast_speed
+                        self.gcode.respond_info(
+                            f"ACE[{self.instance_num}]: Channel speed {fast_speed:.1f}mm/s "
+                            f"for remaining {resume_length:.0f}mm"
+                        )
+                        if not self._change_retract_speed(slot, fast_speed):
+                            # Speed stayed at the original rate. Cover the
+                            # remaining distance before leaving the dwell.
+                            dwell_end = time.time() + (resume_length / speed)
                     if on_wait_for_ready is not None:
                         on_wait_for_ready()
                     check_slot_empty()
@@ -1339,7 +1359,7 @@ class AceInstance:
 
         return None
 
-    def rmd_triggered_unload_slot(self, manager, slot, length, overshoot_length):
+    def rmd_triggered_unload_slot(self, manager, slot, length, overshoot_length, on_retract_wait=None, speed=None, resume_length=0, resume_speed=None):
         """Unload slot with RDM sensor monitoring during retraction.
 
         Monitors the RDM sensor via _retract(early_stop_callback=...) and
@@ -1356,6 +1376,9 @@ class AceInstance:
         if not manager.has_rdm_sensor():
             return False
 
+        retract_speed = self.retract_speed if speed is None else float(speed)
+        resume_length = max(0.0, float(resume_length or 0))
+        fast_speed = self.retract_speed if resume_speed is None else float(resume_speed)
         f_index = self._get_current_feed_assist_index()
         self._disable_feed_assist(slot)
 
@@ -1366,10 +1389,14 @@ class AceInstance:
             "start_time": time.time(),
             "last_log": 0,
         }
+        self._retract_speed_switched = False
+        self._active_retract_speed = retract_speed
 
         def rdm_early_stop_check():
             """Called every ~200ms from _retract()'s dwell loop.
             Returns a truthy string to trigger early stop, or None to continue."""
+            if not self._retract_speed_switched and on_retract_wait is not None:
+                on_retract_wait()
             elapsed = time.time() - rdm_state["start_time"]
 
             rdm_has_filament = manager.get_instant_switch_state(SENSOR_RDM)
@@ -1392,7 +1419,7 @@ class AceInstance:
                 )
 
                 # Overshoot: let the motor run a bit longer before stopping
-                overshoot_time = overshoot_length / self.retract_speed
+                overshoot_time = overshoot_length / self._active_retract_speed
                 if overshoot_time > 0:
                     self.reactor.pause(
                         self.reactor.monotonic() + overshoot_time
@@ -1401,16 +1428,28 @@ class AceInstance:
 
             return None
 
+        if resume_length > 0:
+            speed_desc = (
+                f"{length}mm @ {retract_speed}mm/s, "
+                f"then {resume_length:.0f}mm @ {fast_speed}mm/s"
+            )
+        else:
+            speed_desc = f"max {length}mm @ {retract_speed}mm/s"
         self.gcode.respond_info(
             f"ACE[{self.instance_num}]: RDM-triggered unload — "
-            f"slot {slot}, max {length}mm @ {self.retract_speed}mm/s, "
+            f"slot {slot}, {speed_desc}, "
             f"overshoot {overshoot_length}mm"
         )
 
         try:
+            retract_kwargs = {}
+            if resume_length > 0:
+                retract_kwargs["resume_length"] = resume_length
+                retract_kwargs["resume_speed"] = fast_speed
             result = self._retract(
-                slot, length, self.retract_speed,
+                slot, length, retract_speed,
                 early_stop_callback=rdm_early_stop_check,
+                **retract_kwargs,
             )
         except Exception as e:
             self._stop_retract(slot)
@@ -1481,7 +1520,7 @@ class AceInstance:
             return False
         return getattr(mgr, "toolchange_in_progress", False) is True
 
-    def _smart_unload_slot(self, slot, length=100, on_retract_started=None):
+    def _smart_unload_slot(self, slot, length=100, on_retract_started=None, on_retract_wait=None, speed=None, resume_length=0, resume_speed=None):
         """
         Fixed-length retraction with optional sensor validation.
 
@@ -1502,14 +1541,26 @@ class AceInstance:
             ValueError: If path still blocked after retraction (RDM available only)
         """
         has_rdm = self.manager.has_rdm_sensor()
+        retract_speed = self.retract_speed if speed is None else float(speed)
+        resume_length = max(0.0, float(resume_length or 0))
+        fast_speed = self.retract_speed if resume_speed is None else float(resume_speed)
 
-        timeout_seconds = (length / self.retract_speed) * self.timeout_multiplier
+        expected_time = length / retract_speed
+        if resume_length > 0 and fast_speed > 0:
+            expected_time += resume_length / fast_speed
+        timeout_seconds = expected_time * self.timeout_multiplier
 
         mode_str = "with RDM validation" if has_rdm else "toolhead-only mode"
+        if resume_length > 0:
+            length_desc = (
+                f"{length}mm @ {retract_speed}mm/s, "
+                f"then {resume_length:.0f}mm @ {fast_speed}mm/s"
+            )
+        else:
+            length_desc = f"{length}mm @ {retract_speed}mm/s"
         self.gcode.respond_info(
             f"ACE[{self.instance_num}]: Fixed-length unload slot {slot} ({mode_str}):\n"
-            f"  Length: {length}mm\n"
-            f"  Speed: {self.retract_speed}mm/s\n"
+            f"  Length: {length_desc}\n"
             f"  Timeout: {timeout_seconds:.1f}s"
         )
 
@@ -1523,19 +1574,29 @@ class AceInstance:
 
             start_time = time.time()
 
-            # Start retraction with sensor monitoring
+            # One unwind for the whole distance. After the matched-speed
+            # length, the channel changes speed in place instead of stopping
+            # for a second command. The extruder callback stops once that
+            # speed change has been requested.
+            def _on_monitored_wait():
+                sensor_monitor()
+                if on_retract_wait is not None and not self._retract_speed_switched:
+                    on_retract_wait()
+
+            self._retract_speed_switched = False
             self._retract(
                 slot,
                 length,
-                self.retract_speed,
+                retract_speed,
                 on_retract_started,
-                on_wait_for_ready=sensor_monitor
+                on_wait_for_ready=_on_monitored_wait,
+                resume_length=resume_length,
+                resume_speed=fast_speed,
             )
 
             elapsed_s = time.time() - start_time
             sensor_trigger_time = sensor_monitor.get_timing()
             call_count = sensor_monitor.get_call_count()
-            expected_time = length / self.retract_speed
 
             # Log retraction results with timing data
             if sensor_trigger_time is not None:
@@ -1545,22 +1606,6 @@ class AceInstance:
                     f"(sensor: {sensor_trigger_time:.2f}s, {sensor_efficiency:.1f}% of expected, "
                     f"{call_count} polls)"
                 )
-
-                if sensor_efficiency > 90:
-                    extra_length = self.parkposition_to_toolhead_length
-                    extra_speed = self.retract_speed / 2
-                    self.gcode.respond_info(
-                        f"ACE[{self.instance_num}]: Suspicious late sensor trigger - "
-                        f"Retracting extra parkposition_to_toolhead_length to ensure clear path: "
-                        f"(Length: {extra_length:.2f}mm, "
-                        f"{extra_speed:.1f}mm/s)"
-                    )
-
-                    self._retract(
-                        slot,
-                        extra_length,
-                        extra_speed
-                    )
 
             else:
                 self.gcode.respond_info(

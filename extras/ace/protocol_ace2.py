@@ -668,7 +668,7 @@ class AceProtoProtocolAdapter(AceProtocolAdapter):
             "FEED_OR_ROLLBACK",
             {
                 "index": slot_index,
-                "speed": 10,
+                "speed": 5,
                 "length": 0,
                 "mode": 2,
             },

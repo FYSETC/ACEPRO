@@ -1178,6 +1178,29 @@ class AceManager:
         if wait_for_move_end:
             toolhead.wait_moves()
 
+    def _pace_extruder_during_channel_retract(self, length, speed):
+        """Retract the extruder only while the channel motor is retracting.
+
+        The callback is polled about every 0.2s from the ACE retract wait
+        loop. Each call queues one poll of motion, so the extruder stops
+        when the channel motor stops instead of running out a longer
+        queued retract. Total distance is capped at ``length``.
+        """
+        remaining = abs(length)
+        speed = abs(speed)
+        # Matches the poll interval inside AceInstance._retract().
+        step_window_s = 0.2
+
+        def pace():
+            nonlocal remaining
+            if remaining <= 0 or speed <= 0:
+                return
+            step = min(remaining, speed * step_window_s)
+            self._extruder_move(-step, speed, wait_for_move_end=False)
+            remaining -= step
+
+        return pace
+
     @toolchange_in_progress_guard
     def smart_unload(self, tool_index=-1, prepare_toolhead=True, keep_heater=False,
                      cycle_on_blocked=False):
@@ -1315,13 +1338,38 @@ class AceManager:
                     )
                     instance._disable_feed_assist(local_slot)
 
-                self.gcode.respond_info(
-                    f"ACE: Retracting T{tool_index} "
-                    f"({retract_length:.3f}mm at {retract_speed:.3f}mm/s)"
-                )
+                # Match the extruder only while the tip is still in the gears
+                # (toolhead_retraction_length). The rest of the bowden pull
+                # returns to the channel retract_speed.
+                sync_speed = retract_speed * 1.10
+                total_length = parkposition_to_toolhead_length + retract_length
+                slow_length = min(max(retract_length, 0.0), total_length)
+                fast_length = total_length - slow_length
+                channel_speed = instance.retract_speed
+                if slow_length > 0 and fast_length > 0:
+                    self.gcode.respond_info(
+                        f"ACE: Retracting T{tool_index} "
+                        f"({slow_length:.0f}mm at {sync_speed:.2f}mm/s with the extruder, "
+                        f"then {fast_length:.0f}mm at {channel_speed:.0f}mm/s)"
+                    )
+                elif slow_length > 0:
+                    self.gcode.respond_info(
+                        f"ACE: Retracting T{tool_index} "
+                        f"({slow_length:.0f}mm, extruder and channel at {sync_speed:.2f}mm/s)"
+                    )
+                else:
+                    self.gcode.respond_info(
+                        f"ACE: Retracting T{tool_index} "
+                        f"({total_length:.0f}mm at {channel_speed:.0f}mm/s)"
+                    )
 
-                # Start extruder retraction (10% faster for slack)
-                self._extruder_move(-abs(retract_length), retract_speed * 1.10, wait_for_move_end=False)
+                # Extruder steps only during the matched-speed segment.
+                pace_extruder = None
+                if slow_length > 0:
+                    pace_extruder = self._pace_extruder_during_channel_retract(
+                        slow_length, sync_speed
+                    )
+                split = slow_length > 0 and fast_length > 0
 
                 # Start ACE retraction — use the RDM early stop only when the
                 # RDM actually sees filament right now.  Its callback stops the
@@ -1333,16 +1381,24 @@ class AceManager:
                 if self.has_rdm_sensor() and self.get_instant_switch_state(SENSOR_RDM):
                     unload_ok = instance.rmd_triggered_unload_slot(
                         self, local_slot,
-                        length=parkposition_to_toolhead_length + retract_length,
-                        overshoot_length=instance.rdm_overshoot_length
+                        length=slow_length if split else total_length,
+                        overshoot_length=instance.rdm_overshoot_length,
+                        speed=sync_speed if slow_length > 0 else None,
+                        on_retract_wait=pace_extruder,
+                        resume_length=fast_length if split else 0,
+                        resume_speed=channel_speed,
                     )
                 else:
                     unload_ok = instance._smart_unload_slot(
                         local_slot,
-                        length=parkposition_to_toolhead_length + retract_length,
+                        length=slow_length if split else total_length,
+                        speed=sync_speed if slow_length > 0 else None,
+                        on_retract_wait=pace_extruder,
+                        resume_length=fast_length if split else 0,
+                        resume_speed=channel_speed,
                     )
 
-                # Wait for extruder to finish
+                # At most one poll of extruder motion is still queued.
                 self._wait_toolhead_move_finished()
 
                 if unload_ok and self.is_filament_path_free_instant():

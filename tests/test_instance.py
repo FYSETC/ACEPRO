@@ -1083,6 +1083,23 @@ class TestFeedAndStopHelpers(unittest.TestCase):
         self.assertTrue(any("Stop feed successful" in m for m in msgs))
 
     @patch('ace.instance.AceSerialManager')
+    def test_retract_switches_speed_without_a_second_command(self, mock_serial_mgr_class):
+        """The fast remainder is a speed update on the same unwind."""
+        instance = AceInstance(0, self.ace_config, self.mock_printer)
+        instance._info["slots"][0]["status"] = "ready"
+        instance.wait_ready = Mock()
+        instance._change_retract_speed = Mock(return_value=True)
+
+        def send_request(req, cb):
+            cb({"code": 0, "msg": "ok"})
+
+        instance.send_request = Mock(side_effect=send_request)
+        instance._retract(0, 2, 200.0, resume_length=2, resume_speed=100.0)
+
+        instance.send_request.assert_called_once()
+        instance._change_retract_speed.assert_called_once_with(0, 100.0)
+
+    @patch('ace.instance.AceSerialManager')
     def test_stop_retract_success_and_error(self, mock_serial_mgr_class):
         instance = AceInstance(0, self.ace_config, self.mock_printer)
         responses = [
@@ -3919,15 +3936,50 @@ class TestSmartUnloadSlot(unittest.TestCase):
 
         self.assertTrue(result)
         instance._disable_feed_assist.assert_called_once_with(1)
-        instance._retract.assert_called_once_with(
-            1, 100, instance.retract_speed, None, on_wait_for_ready=monitor
-        )
+        instance._retract.assert_called_once()
+        args, kwargs = instance._retract.call_args
+        self.assertEqual(args, (1, 100, instance.retract_speed, None))
+        kwargs["on_wait_for_ready"]()
+        self.assertEqual(monitor.calls, 1)
         # Validation checked both sensors
         self.assertEqual(manager.get_switch_state.call_count, 2)
 
     @patch('ace.instance.AceSerialManager')
+    def test_synced_length_then_channel_speed(self, mock_serial_mgr_class):
+        """Matched speed is one unwind; the extruder callback stops after the speed switch."""
+        instance = AceInstance(0, self.ace_config, self.mock_printer)
+        manager = Mock()
+        manager.has_rdm_sensor.return_value = False
+        manager.get_switch_state.return_value = False
+        INSTANCE_MANAGERS[0] = manager
+
+        monitor = self._DummyMonitor(timing=None)
+        instance._make_sensor_trigger_monitor = Mock(return_value=monitor)
+        instance._disable_feed_assist = Mock()
+        instance._retract = Mock()
+        instance.dwell = Mock()
+        paced = []
+
+        result = instance._smart_unload_slot(
+            1, length=100, speed=5.5, on_retract_wait=lambda: paced.append(1),
+            resume_length=200, resume_speed=50,
+        )
+
+        self.assertTrue(result)
+        instance._retract.assert_called_once()
+        call_args = instance._retract.call_args
+        self.assertEqual(call_args.args[:3], (1, 100, 5.5))
+        self.assertEqual(call_args.kwargs["resume_length"], 200)
+        self.assertEqual(call_args.kwargs["resume_speed"], 50)
+        call_args.kwargs["on_wait_for_ready"]()
+        self.assertEqual(paced, [1])
+        instance._retract_speed_switched = True
+        call_args.kwargs["on_wait_for_ready"]()
+        self.assertEqual(paced, [1])
+
+    @patch('ace.instance.AceSerialManager')
     def test_rdm_mode_extra_retract_and_rdm_recovery(self, mock_serial_mgr_class):
-        """Late sensor trigger forces extra retract; RDM-assisted recovery succeeds."""
+        """A late sensor clear does not add another retract; RDM recovery still runs."""
         instance = AceInstance(0, self.ace_config, self.mock_printer)
         manager = Mock()
         manager.has_rdm_sensor.return_value = True
@@ -3944,14 +3996,11 @@ class TestSmartUnloadSlot(unittest.TestCase):
         result = instance._smart_unload_slot(2, length=120)
 
         self.assertTrue(result)
-        # Initial retract + extra retract due to late sensor trigger
-        self.assertEqual(
-            instance._retract.call_args_list,
-            [
-                call(2, 120, instance.retract_speed, None, on_wait_for_ready=monitor),
-                call(2, instance.parkposition_to_toolhead_length, instance.retract_speed / 2),
-            ],
-        )
+        instance._retract.assert_called_once()
+        first_args, first_kwargs = instance._retract.call_args
+        self.assertEqual(first_args, (2, 120, instance.retract_speed, None))
+        first_kwargs["on_wait_for_ready"]()
+        self.assertEqual(monitor.calls, 1)
         instance.rmd_triggered_unload_slot.assert_called_once_with(
             manager, 2, 120, instance.parkposition_to_rdm_length
         )

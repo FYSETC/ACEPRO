@@ -4433,6 +4433,57 @@ class TestSmartUnload(unittest.TestCase):
         instance._smart_unload_slot.assert_called_once()
         manager.state.set.assert_called_with("ace_filament_pos", FILAMENT_STATE_BOWDEN)
 
+    def test_extruder_retract_stops_when_channel_retract_ends(self):
+        """Channel motor stopping ends the extruder retract.
+
+        The full toolhead_retraction_length is not queued up front. The
+        extruder only steps while the channel retract's wait callback runs.
+        """
+        instance = self._make_instance()
+        manager = self._build_manager(lambda *a, **k: instance)
+        manager.state.set = Mock()
+        for slot in manager.instances[0].inventory:
+            slot["status"] = "ready"
+        manager.prepare_toolhead_for_filament_retraction = Mock()
+        manager.toolhead_retraction_length = 100.0
+        manager.toolhead_retraction_speed = 5.0
+        manager.get_instant_switch_state = Mock(return_value=True)
+        manager.get_switch_state = Mock(return_value=True)
+        manager.has_rdm_sensor = Mock(return_value=False)
+        manager.is_filament_path_free_instant = Mock(return_value=True)
+        manager._extruder_move = Mock()
+        manager._wait_toolhead_move_finished = Mock()
+
+        instance.retract_speed = 50.0
+        captured = {}
+
+        def fake_unload(slot, length=100, on_retract_started=None, on_retract_wait=None,
+                        speed=None, resume_length=0, resume_speed=None):
+            captured["length"] = length
+            captured["speed"] = speed
+            captured["resume_length"] = resume_length
+            captured["resume_speed"] = resume_speed
+            for _ in range(3):
+                on_retract_wait()
+            return True
+
+        instance._smart_unload_slot = Mock(side_effect=fake_unload)
+
+        result = manager.smart_unload(tool_index=0, prepare_toolhead=False)
+
+        self.assertTrue(result)
+        self.assertEqual(captured["length"], 100.0)
+        self.assertAlmostEqual(captured["speed"], 5.0 * 1.10, places=3)
+        self.assertEqual(captured["resume_length"], 500.0)
+        self.assertEqual(captured["resume_speed"], 50.0)
+        distances = [call.args[0] for call in manager._extruder_move.call_args_list]
+        self.assertEqual(len(distances), 3)
+        self.assertTrue(all(d < 0 for d in distances))
+        total = sum(-d for d in distances)
+        self.assertAlmostEqual(total, 3 * 5.0 * 1.10 * 0.2, places=3)
+        self.assertLess(total, 100.0)
+        manager._wait_toolhead_move_finished.assert_called_once()
+
     def test_keep_heater_false_turns_off_heater(self):
         """When keep_heater=False (standalone unload), heater is turned off."""
         instance = self._make_instance()
